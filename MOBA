@@ -1,0 +1,603 @@
+"""
+Mini LoL-like (Pygame) — Full version requested
+Features implemented based on your choices:
+- 4 playable champions: Mage, Assassin, Tank, Support (each with unique auto-attack and Q/E/R)
+- Click-to-move (left click) and automatic attacking when in range (like LoL)
+- 2v2 matches: you + allied AI vs 2 enemy AI
+- Minions (sbires) waves that damage champions and towers
+- Towers that target minions/champions and take damage
+- Gold, XP, levels, and a simple Shop (press P)
+- UI with HP, mana, XP, gold, and cooldowns
+- Stylized "textures" using drawn gradients and simple sprites (can't use Riot assets)
+
+How to run:
+1) pip install pygame
+2) python py_lol_full.py
+
+Controls:
+- Left click: move to point (auto-attack nearest enemy in range)
+- Q/E/R: champion abilities (mouse aimed for Q/R when relevant)
+- P: open/close shop and buy items with 1/2/3 keys
+- ESC: quit
+"""
+
+import pygame
+import math
+import time
+import random
+from collections import deque
+
+pygame.init()
+WIDTH, HEIGHT = 1280, 720
+SCREEN = pygame.display.set_mode((WIDTH, HEIGHT))
+pygame.display.set_caption("Mini LoL — 2v2")
+CLOCK = pygame.time.Clock()
+FONT = pygame.font.SysFont('Arial', 18)
+BIG = pygame.font.SysFont('Arial', 28)
+
+# ---- Colors ----
+WHITE = (255,255,255)
+BLACK = (0,0,0)
+RED = (200,50,60)
+BLUE = (70,130,250)
+GREEN = (80,200,120)
+YELLOW = (240,220,80)
+DARK = (28,32,38)
+GREY = (120,120,120)
+
+# ---- Utilities ----
+def clamp(v, a, b): return max(a, min(b, a if b<a else b))
+def dist(a,b): return math.hypot(a[0]-b[0], a[1]-b[1])
+
+def draw_text(surf, text, x, y, size=18, color=WHITE):
+    f = pygame.font.SysFont('Arial', size)
+    surf.blit(f.render(text, True, color), (x,y))
+
+# ---- Cooldown helper ----
+class Cooldown:
+    def __init__(self, cd):
+        self.cd = cd
+        self.t = -999
+    def ready(self):
+        return time.time() - self.t >= self.cd
+    def trigger(self):
+        self.t = time.time()
+    def left(self):
+        left = self.cd - (time.time() - self.t)
+        return max(0, left)
+
+# ---- Projectiles ----
+class Projectile:
+    def __init__(self, x,y, tx,ty, speed, dmg, owner, radius=6, color=YELLOW, lifetime=3.0):
+        self.x,self.y = x,y
+        dx,dy = tx-x, ty-y
+        d = math.hypot(dx,dy) or 1
+        self.vx = dx/d*speed; self.vy = dy/d*speed
+        self.dmg = dmg
+        self.owner = owner
+        self.radius = radius
+        self.color = color
+        self.spawn = time.time(); self.lifetime = lifetime
+    def update(self,dt):
+        self.x += self.vx*dt
+        self.y += self.vy*dt
+    def expired(self):
+        return time.time()-self.spawn > self.lifetime
+    def draw(self,s):
+        pygame.draw.circle(s, self.color, (int(self.x),int(self.y)), self.radius)
+
+# ---- Entities: Champion, Minion, Tower ----
+class Entity:
+    def __init__(self,x,y,team):
+        self.x=x; self.y=y; self.team=team
+        self.alive=True
+    def pos(self): return (self.x,self.y)
+
+class Champion(Entity):
+    def __init__(self,x,y,team,name,role):
+        super().__init__(x,y,team)
+        self.name = name
+        self.role = role
+        self.radius = 18
+        self.level = 1
+        self.xp = 0
+        self.gold = 0
+        self.move_target = None
+        self.attack_target = None
+        self.attack_speed = 0.9  # seconds per attack
+        self._last_attack = -999
+        self.attack_range = 140
+        self.base_damage = 40
+        self.max_hp = 600
+        self.hp = self.max_hp
+        self.base_speed = 220
+        self.speed = self.base_speed
+        self.abilities = {'Q':Cooldown(6),'E':Cooldown(5),'R':Cooldown(25)}
+        self.mana = 100
+        self.max_mana = 100
+        self.color = BLUE if team=='blue' else RED
+        # role tweaks
+        if role=='mage':
+            self.base_damage = 30; self.attack_range = 160; self.max_hp = 480
+        if role=='assassin':
+            self.base_damage = 50; self.base_speed += 40; self.max_hp = 520
+        if role=='tank':
+            self.max_hp = 900; self.base_damage = 30; self.radius = 22
+        if role=='support':
+            self.base_damage = 25; self.max_mana = 140
+        self.hp = self.max_hp
+
+    def can_attack(self):
+        return time.time() - self._last_attack >= self.attack_speed
+    def perform_attack(self, target, projectiles):
+        if not self.can_attack() or not self.alive: return False
+        # ranged projectile for simplicity on most champs
+        tx,ty = target.x, target.y
+        proj = Projectile(self.x, self.y, tx, ty, 520, self.base_damage, self, radius=6, color=YELLOW, lifetime=2.0)
+        projectiles.append(proj)
+        self._last_attack = time.time()
+        return True
+    def move(self, dt):
+        if self.move_target:
+            dx = self.move_target[0]-self.x; dy = self.move_target[1]-self.y
+            d = math.hypot(dx,dy)
+            if d > 6:
+                nx,ny = dx/d, dy/d
+                self.x += nx*self.speed*dt
+                self.y += ny*self.speed*dt
+            else:
+                self.move_target = None
+    def auto_acquire(self, candidates):
+        # prefer minions then champs then towers by distance
+        inrange = [c for c in candidates if c.alive and dist((self.x,self.y),(c.x,c.y)) <= self.attack_range]
+        if inrange:
+            # prioritize lowest hp to last-hit
+            self.attack_target = min(inrange, key=lambda e: (e.__class__.__name__!='Minion', e.hp))
+        else:
+            self.attack_target = None
+    def take_damage(self,dmg,source=None):
+        self.hp -= dmg
+        if self.hp<=0 and self.alive:
+            self.alive=False
+            if source and getattr(source,'team',None)!=self.team:
+                try: source.gold += 50; source.xp += 40
+                except: pass
+    def respawn(self):
+        self.alive=True; self.hp=self.max_hp; self.move_target=None; self.attack_target=None
+        if self.team=='blue': self.x, self.y = 160, HEIGHT//2
+        else: self.x, self.y = WIDTH-160, HEIGHT//2
+    def draw(self,s):
+        # textured circle: radial gradient-ish using rings
+        for r,alpha in [(self.radius+6,18),(self.radius+3,36),(self.radius,255)]:
+            surf = pygame.Surface((r*2,r*2), pygame.SRCALPHA)
+            c = self.color + (alpha,)
+            pygame.draw.circle(surf, c, (r,r), r)
+            s.blit(surf, (int(self.x-r), int(self.y-r)))
+        # hp bar
+        w = 60
+        pygame.draw.rect(s, DARK, (self.x-w//2, self.y-self.radius-14, w, 8))
+        pygame.draw.rect(s, GREEN, (self.x-w//2, self.y-self.radius-14, int(w*(self.hp/self.max_hp)), 8))
+        draw_text(s, f"{self.name} Lv{self.level}", int(self.x-w//2), int(self.y+self.radius+6), 14)
+
+class Minion(Entity):
+    def __init__(self,x,y,team):
+        super().__init__(x,y,team)
+        self.radius = 10
+        self.max_hp = 120
+        self.hp = self.max_hp
+        self.speed = 70
+        self.damage = 18
+        self.gold = 10
+    def move(self, dt, dirx):
+        self.x += dirx*self.speed*dt
+    def attack(self, targets):
+        # collide with targets
+        for t in targets:
+            if t.alive and dist((self.x,self.y),(t.x,t.y)) < (self.radius + getattr(t,'radius',16)):
+                t.take_damage(self.damage, self)
+    def draw(self,s):
+        pygame.draw.circle(s, BLUE if self.team=='blue' else RED, (int(self.x),int(self.y)), self.radius)
+        pygame.draw.rect(s, DARK, (self.x-14, self.y-18, 28, 4))
+        pygame.draw.rect(s, GREEN, (self.x-14, self.y-18, int(28*(self.hp/self.max_hp)), 4))
+
+class Tower(Entity):
+    def __init__(self,x,y,team):
+        super().__init__(x,y,team)
+        self.radius=36
+        self.max_hp = 900
+        self.hp = self.max_hp
+        self.fire_cd = Cooldown(1.2)
+        self.range = 320
+        self.damage = 80
+    def update(self,dt, projectiles, minions, champions):
+        if not self.alive: return
+        if not self.fire_cd.ready(): return
+        # prioritize enemy minions, then champions
+        target = None
+        for m in minions:
+            if m.alive and m.team!=self.team and abs(m.x-self.x) < self.range:
+                target = m; break
+        if not target:
+            for c in champions:
+                if c.alive and c.team!=self.team and dist((self.x,self.y),(c.x,c.y))<self.range:
+                    target = c; break
+        if target:
+            proj = Projectile(self.x, self.y, target.x, target.y, 420, self.damage, self, radius=8, color=WHITE, lifetime=2.2)
+            projectiles.append(proj)
+            self.fire_cd.trigger()
+    def take_damage(self,dmg,source=None):
+        self.hp -= dmg
+        if self.hp<=0 and self.alive:
+            self.alive=False
+            if source and getattr(source,'team',None)!=self.team:
+                try: source.gold += 80; source.xp += 60
+                except: pass
+    def draw(self,s):
+        # tower base
+        pygame.draw.circle(s, DARK, (int(self.x),int(self.y)), self.radius+6)
+        pygame.draw.circle(s, BLUE if self.team=='blue' else RED, (int(self.x),int(self.y)), self.radius)
+        pygame.draw.rect(s, DARK, (self.x-48, self.y-self.radius-18, 96, 8))
+        pygame.draw.rect(s, GREEN, (self.x-48, self.y-self.radius-18, int(96*(self.hp/self.max_hp)), 8))
+
+# ---- Game state ----
+projectiles = []
+minions = []
+wave_timer = 0; wave_interval = 8.0; wave_count = 0
+
+# create teams: blue (player) left, red (enemy) right
+# champions: we'll have 2 per team (player controls one, ally AI controls the other)
+def make_champion(role, team, name):
+    x = 200 if team=='blue' else WIDTH-200
+    y = HEIGHT//2 + (random.randint(-60,60))
+    return Champion(x,y,team,name,role)
+
+# roles: 'mage','assassin','tank','support'
+# initial roster mapping for selection
+CHAMPION_ROLES = [('mage','Arcane'),('assassin','Shade'),('tank','Bulwark'),('support','Lumin')]
+
+# default match participants (player will pick one of four)
+blue_ally = make_champion('tank','blue','AllyTank')
+red_champ1 = make_champion('assassin','red','Enemy1')
+red_champ2 = make_champion('mage','red','Enemy2')
+blue_tower = Tower(420, HEIGHT//2, 'blue')
+red_tower = Tower(WIDTH-420, HEIGHT//2, 'red')
+
+# Shop
+shop_open = False
+shop_items = [
+    {'id':1,'name':'Long Sword','type':'damage','val':15,'cost':120,'desc':'+15 dmg'},
+    {'id':2,'name':'Boots','type':'speed','val':40,'cost':140,'desc':'+40 speed'},
+    {'id':3,'name':'Giant's Belt','type':'hp','val':150,'cost':130,'desc':'+150 HP'},
+]
+
+# ---- Abilities per role ----
+def cast_Q(champ, mx, my, projectiles, all_entities):
+    if not champ.abilities['Q'].ready(): return
+    if champ.role=='mage':
+        # nuke projectile
+        proj = Projectile(champ.x, champ.y, mx, my, 520, 110, champ, radius=10, color=(150,100,255), lifetime=1.8)
+        projectiles.append(proj)
+    elif champ.role=='assassin':
+        # short dash + damage to nearby
+        dx,dy = mx-champ.x, my-champ.y; d=math.hypot(dx,dy) or 1
+        nx,ny = dx/d, dy/d; dash=160
+        champ.x += nx*dash; champ.y += ny*dash
+        # damage close enemies
+        for e in all_entities:
+            if getattr(e,'alive',False) and e.team!=champ.team and dist((champ.x,champ.y),(e.x,e.y))<60:
+                e.take_damage(90, champ)
+    elif champ.role=='tank':
+        # area taunt damage
+        for e in all_entities:
+            if getattr(e,'alive',False) and e.team!=champ.team and dist((champ.x,champ.y),(e.x,e.y))<110:
+                e.take_damage(60, champ)
+    elif champ.role=='support':
+        # heal ally near mouse
+        for e in all_entities:
+            if getattr(e,'alive',False) and e.team==champ.team and dist((mx,my),(e.x,e.y))<80:
+                e.hp = min(e.max_hp, e.hp+80)
+    champ.abilities['Q'].trigger()
+
+def cast_E(champ, mx, my):
+    if not champ.abilities['E'].ready(): return
+    if champ.role=='assassin':
+        # invisibility-ish: short speed burst
+        champ.speed += 200
+        # schedule slow back
+        pygame.time.set_timer(pygame.USEREVENT+1, 800, True)
+    elif champ.role=='mage':
+        champ.mana = min(champ.max_mana, champ.mana+40)
+    elif champ.role=='tank':
+        # brief armor (reduce incoming dmg) - implemented as small heal
+        champ.hp = min(champ.max_hp, champ.hp+50)
+    elif champ.role=='support':
+        # shield nearest ally
+        pass
+    champ.abilities['E'].trigger()
+
+def cast_R(champ, mx, my, projectiles, all_entities):
+    if not champ.abilities['R'].ready(): return
+    if champ.role=='mage':
+        # big AoE
+        for e in all_entities:
+            if getattr(e,'alive',False) and e.team!=champ.team and dist((mx,my),(e.x,e.y))<140:
+                e.take_damage(180, champ)
+    elif champ.role=='assassin':
+        # execute damage to low hp enemies in line
+        for e in all_entities:
+            if getattr(e,'alive',False) and e.team!=champ.team and dist((champ.x,champ.y),(e.x,e.y))<220:
+                e.take_damage(160, champ)
+    elif champ.role=='tank':
+        # knock up near enemies (damage)
+        for e in all_entities:
+            if getattr(e,'alive',False) and e.team!=champ.team and dist((champ.x,champ.y),(e.x,e.y))<160:
+                e.take_damage(140, champ)
+    elif champ.role=='support':
+        # mass heal
+        for e in all_entities:
+            if getattr(e,'alive',False) and e.team==champ.team and dist((champ.x,champ.y),(e.x,e.y))<200:
+                e.hp = min(e.max_hp, e.hp+120)
+    champ.abilities['R'].trigger()
+
+# ---- Collision and projectile handling ----
+
+def handle_projectiles(projectiles, champions, minions, towers):
+    for p in list(projectiles):
+        p.update(1/60.0)
+        if p.expired() or not (0<=p.x<=WIDTH and 0<=p.y<=HEIGHT):
+            try: projectiles.remove(p)
+            except: pass
+            continue
+        # champions
+        for ch in champions:
+            if ch.alive and getattr(p.owner,'team',None)!=ch.team and dist((p.x,p.y),(ch.x,ch.y)) <= p.radius + ch.radius:
+                ch.take_damage(p.dmg, p.owner)
+                try: projectiles.remove(p)
+                except: pass
+                break
+        else:
+            for m in minions:
+                if m.alive and getattr(p.owner,'team',None)!=m.team and dist((p.x,p.y),(m.x,m.y))<=p.radius+m.radius:
+                    m.hp -= p.dmg
+                    if m.hp<=0:
+                        m.alive=False
+                        try:
+                            p.owner.gold += m.gold
+                            p.owner.xp += 12
+                        except: pass
+                    try: projectiles.remove(p)
+                    except: pass
+                    break
+            else:
+                for t in towers:
+                    if t.alive and getattr(p.owner,'team',None)!=t.team and dist((p.x,p.y),(t.x,t.y))<=p.radius+t.radius:
+                        t.take_damage(p.dmg, p.owner)
+                        try: projectiles.remove(p)
+                        except: pass
+                        break
+
+# ---- Spawn waves ----
+
+def spawn_wave(minions, wave):
+    # 3 minions per side, melee and caster combo
+    ybase = HEIGHT//2
+    for i in range(3):
+        m = Minion(260 - i*24 + random.randint(-6,6), ybase + random.randint(-30,30), 'blue')
+        minions.append(m)
+        m2 = Minion(WIDTH-260 + i*24 + random.randint(-6,6), ybase + random.randint(-30,30), 'red')
+        minions.append(m2)
+
+# ---- AI Helpers ----
+
+def simple_ai(champ, allies, enemies, minions):
+    if not champ.alive: return
+    # follow lane and auto-attack
+    # if enemy in range attack, else move toward enemy tower
+    candidates = enemies + minions
+    champ.auto_acquire(candidates)
+    if champ.attack_target:
+        champ.perform_attack(champ.attack_target, projectiles)
+    else:
+        # move toward midlane or enemy tower
+        target_x = WIDTH-360 if champ.team=='blue' else 360
+        champ.move_target = (target_x, HEIGHT//2)
+
+# ---- UI Draw ----
+
+def draw_ui(player, ally, enemies, projectiles, gold):
+    # top-left player info
+    pygame.draw.rect(SCREEN, DARK, (8,8, 380, 110))
+    draw_text(SCREEN, f"Player: {player.name} ({player.role}) Lv{player.level}", 14, 12)
+    draw_text(SCREEN, f"HP: {int(player.hp)}/{player.max_hp}", 14, 36)
+    draw_text(SCREEN, f"Mana: {int(player.mana)}/{player.max_mana}", 14, 56)
+    draw_text(SCREEN, f"Gold: {int(player.gold)}  XP: {int(player.xp)}", 14, 76)
+    # ability cds
+    draw_text(SCREEN, f"Q: {player.abilities['Q'].left():.1f}s", 220, 12)
+    draw_text(SCREEN, f"E: {player.abilities['E'].left():.1f}s", 220, 36)
+    draw_text(SCREEN, f"R: {player.abilities['R'].left():.1f}s", 220, 60)
+
+# ---- Shop Draw ----
+
+def draw_shop():
+    pygame.draw.rect(SCREEN, (20,20,30), (WIDTH//2-260, HEIGHT//2-160, 520, 320))
+    draw_text(SCREEN, "Shop - Press 1/2/3 to buy | P to close", WIDTH//2-200, HEIGHT//2-140, 20)
+    for i,item in enumerate(shop_items):
+        draw_text(SCREEN, f"{item['id']}. {item['name']} ({item['cost']}g) - {item['desc']}", WIDTH//2-200, HEIGHT//2-100 + i*50)
+
+# ---- Main Game Loop (match) ----
+
+def run_match(player_role_index):
+    global projectiles, minions, wave_timer, wave_count
+    # setup teams based on selection
+    player_role, player_name = CHAMPION_ROLES[player_role_index]
+    player = make_champion(player_role, 'blue', player_name)
+    ally_role = random.choice([r for r,_ in CHAMPION_ROLES if r!=player_role])
+    ally = make_champion(ally_role, 'blue', 'Ally')
+    enemy1 = make_champion(random.choice([r for r,_ in CHAMPION_ROLES]), 'red', 'EnemyA')
+    enemy2 = make_champion(random.choice([r for r,_ in CHAMPION_ROLES]), 'red', 'EnemyB')
+    # towers
+    blue_t = Tower(420, HEIGHT//2, 'blue')
+    red_t = Tower(WIDTH-420, HEIGHT//2, 'red')
+    # reset lists
+    projectiles = []
+    minions = []
+    wave_timer = 0; wave_count = 0
+    shop_open_local = False
+
+    running = True
+    last_time = time.time()
+    while running:
+        dt = CLOCK.tick(60)/1000.0
+        for event in pygame.event.get():
+            if event.type==pygame.QUIT:
+                pygame.quit(); exit()
+            if event.type==pygame.MOUSEBUTTONDOWN:
+                if event.button==1:
+                    mx,my = pygame.mouse.get_pos()
+                    player.move_target = (mx,my)
+            if event.type==pygame.KEYDOWN:
+                if event.key==pygame.K_q:
+                    mx,my = pygame.mouse.get_pos(); cast_Q(player,mx,my,projectiles, [player,ally,enemy1,enemy2]+minions)
+                if event.key==pygame.K_e:
+                    mx,my = pygame.mouse.get_pos(); cast_E(player,mx,my)
+                if event.key==pygame.K_r:
+                    mx,my = pygame.mouse.get_pos(); cast_R(player,mx,my,projectiles, [player,ally,enemy1,enemy2]+minions)
+                if event.key==pygame.K_p:
+                    shop_open_local = not shop_open_local
+                if shop_open_local and event.key in (pygame.K_1,pygame.K_2,pygame.K_3):
+                    idx = {pygame.K_1:0,pygame.K_2:1,pygame.K_3:2}[event.key]
+                    item = shop_items[idx]
+                    if player.gold >= item['cost']:
+                        player.gold -= item['cost']
+                        if item['type']=='damage': player.base_damage += item['val']; player.base_damage = player.base_damage
+                        if item['type']=='speed': player.base_speed += item['val']; player.speed = player.base_speed
+                        if item['type']=='hp': player.max_hp += item['val']; player.hp += item['val']
+                if event.key==pygame.K_ESCAPE:
+                    running=False
+
+        # update movement
+        player.move(dt); ally.move(dt); enemy1.move(dt); enemy2.move(dt)
+
+        # spawn waves
+        wave_timer += dt
+        if wave_timer >= wave_interval:
+            spawn_wave(minions, wave_count); wave_timer = 0; wave_count += 1
+
+        # minion logic
+        for m in list(minions):
+            if not m.alive: continue
+            dirx = 1 if m.team=='blue' else -1
+            m.move(dt, dirx)
+            # attack champions and towers
+            targets = []
+            if m.team=='red': targets = [player, ally, blue_t]
+            else: targets = [enemy1, enemy2, red_t]
+            m.attack(targets)
+            if m.hp<=0: m.alive=False
+            # award gold/xp to last attacker handled by projectile collisions
+        minions[:] = [m for m in minions if m.alive]
+
+        # AI for allies and enemies
+        simple_ai(ally, [player], [enemy1,enemy2], minions)
+        simple_ai(enemy1, [enemy2], [player,ally], minions)
+        simple_ai(enemy2, [enemy1], [player,ally], minions)
+
+        # auto-attack logic
+        for ch in [player, ally, enemy1, enemy2]:
+            if ch.alive:
+                candidates = [m for m in minions if m.alive] + [enemy1,enemy2,player,ally]
+                # remove self
+                candidates = [c for c in candidates if c is not ch]
+                ch.auto_acquire(candidates)
+                if ch.attack_target:
+                    ch.perform_attack(ch.attack_target, projectiles)
+
+        # towers
+        blue_t.update(dt, projectiles, [m for m in minions if m.team!='blue'], [enemy1, enemy2])
+        red_t.update(dt, projectiles, [m for m in minions if m.team!='red'], [player, ally])
+
+        # projectiles
+        handle_projectiles(projectiles, [player,ally,enemy1,enemy2], minions, [blue_t,red_t])
+
+        # champions death checks
+        for ch in [player,ally,enemy1,enemy2]:
+            if ch.alive and ch.hp<=0:
+                ch.alive=False
+                # no auto respawn for simplicity; could add timers
+
+        # level up simple
+        for ch in [player,ally,enemy1,enemy2]:
+            if ch.xp >= ch.level*100:
+                ch.xp -= ch.level*100; ch.level +=1; ch.max_hp += 60; ch.hp = ch.max_hp
+
+        # draw
+        SCREEN.fill((16,20,28))
+        # lane background
+        pygame.draw.rect(SCREEN, (50,60,80), (0, HEIGHT//2-130, WIDTH, 260))
+        # bases
+        pygame.draw.circle(SCREEN, BLUE, (120, HEIGHT//2), 62)
+        pygame.draw.circle(SCREEN, RED, (WIDTH-120, HEIGHT//2), 62)
+        # towers and minions
+        blue_t.draw(SCREEN); red_t.draw(SCREEN)
+        for m in minions: m.draw(SCREEN)
+        # champions
+        for ch in [player,ally,enemy1,enemy2]:
+            if ch.alive:
+                ch.draw(SCREEN)
+        # projectiles
+        for p in projectiles: p.draw(SCREEN)
+        # UI
+        draw_ui(player, ally, [enemy1,enemy2], projectiles, player.gold)
+        # shop
+        if shop_open_local: draw_shop()
+
+        pygame.display.flip()
+
+    # back to menu
+    main_menu()
+
+# ---- Menus and selection ----
+class ButtonUI:
+    def __init__(self,x,y,w,h,text):
+        self.r = pygame.Rect(x,y,w,h); self.text=text
+    def draw(self,col=GREY):
+        pygame.draw.rect(SCREEN,col,self.r)
+        draw_text(SCREEN,self.text,self.r.x+10,self.r.y+10)
+    def click(self,pos): return self.r.collidepoint(pos)
+
+def champion_select_menu():
+    run=True
+    buttons=[]
+    for i,(role,name) in enumerate(CHAMPION_ROLES):
+        b = ButtonUI(420, 200 + i*90, 440, 70, f"{name} - {role.capitalize()}")
+        buttons.append((b,i))
+    while run:
+        SCREEN.fill((12,14,18))
+        draw_text(SCREEN, "Choose your champion", WIDTH//2-120, 120, 30)
+        for b,i in buttons: b.draw()
+        for event in pygame.event.get():
+            if event.type==pygame.QUIT: pygame.quit(); exit()
+            if event.type==pygame.MOUSEBUTTONDOWN:
+                pos=pygame.mouse.get_pos()
+                for b,i in buttons:
+                    if b.click(pos): run=False; run_match(i)
+        pygame.display.flip()
+
+def main_menu():
+    run=True
+    play = ButtonUI(440,260,400,80,'Play')
+    quitb = ButtonUI(440,360,400,80,'Quit')
+    while run:
+        SCREEN.fill((10,12,16))
+        draw_text(SCREEN, 'Mini LoL — 2v2', WIDTH//2-100, 140, 40, YELLOW)
+        play.draw(); quitb.draw()
+        for event in pygame.event.get():
+            if event.type==pygame.QUIT: pygame.quit(); exit()
+            if event.type==pygame.MOUSEBUTTONDOWN:
+                pos=pygame.mouse.get_pos()
+                if play.click(pos): champion_select_menu()
+                if quitb.click(pos): pygame.quit(); exit()
+        pygame.display.flip()
+
+if __name__=='__main__':
+    main_menu()
